@@ -323,7 +323,7 @@ class DataIter:
                         group=None,
                         label_lower_bound=None, label_upper_bound=None,
                         feature_names=None, feature_types=None,
-                        feature_weights=None):
+                        feature_weights=None, subsample_group=None):
             from .data import dispatch_device_quantile_dmatrix_set_data
             from .data import _device_quantile_transform
             data, feature_names, feature_types = _device_quantile_transform(
@@ -337,7 +337,8 @@ class DataIter:
                                 label_upper_bound=label_upper_bound,
                                 feature_names=feature_names,
                                 feature_types=feature_types,
-                                feature_weights=feature_weights)
+                                feature_weights=feature_weights,
+                                subsample_group=subsample_group)
         try:
             # Differ the exception in order to return 0 and stop the iteration.
             # Exception inside a ctype callback function has no effect except
@@ -439,7 +440,8 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
                  feature_names=None,
                  feature_types=None,
                  nthread=None,
-                 enable_categorical=False):
+                 enable_categorical=False,
+                 subsample_group=None):
         """Parameters
         ----------
         data : os.PathLike/string/numpy.array/scipy.sparse/pd.DataFrame/
@@ -484,6 +486,8 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
             rest (one hot) categorical split.  Also, JSON serialization format,
             `gpu_predictor` and pandas input are required.
 
+        subsample_group : list, numpy 1-D array or cudf.DataFrame , optional
+            subsample group for each instance.
         """
         if isinstance(data, list):
             raise TypeError('Input data can not be a list.')
@@ -507,7 +511,8 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         assert handle is not None
         self.handle = handle
 
-        self.set_info(label=label, weight=weight, base_margin=base_margin)
+        self.set_info(label=label, weight=weight, base_margin=base_margin,
+            subsample_group=subsample_group)
 
         if feature_names is not None:
             self.feature_names = feature_names
@@ -527,7 +532,8 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
                  label_upper_bound=None,
                  feature_names=None,
                  feature_types=None,
-                 feature_weights=None):
+                 feature_weights=None,
+                 subsample_group=None):
         '''Set meta info for DMatrix.'''
         if label is not None:
             self.set_label(label)
@@ -549,6 +555,8 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
             from .data import dispatch_meta_backend
             dispatch_meta_backend(matrix=self, data=feature_weights,
                                   name='feature_weights')
+        if subsample_group is not None:
+            self.set_subsample_group(subsample_group)
 
     def get_float_info(self, field):
         """Get float property from the DMatrix.
@@ -709,6 +717,17 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         from .data import dispatch_meta_backend
         dispatch_meta_backend(self, group, 'group', 'uint32')
 
+    def set_subsample_group(self, subsample_group):
+        """Set subsample group of each instance.
+
+        Parameters
+        ----------
+        subsample_group : array like
+            Subsample group for each data point
+        """
+        from .data import dispatch_meta_backend
+        dispatch_meta_backend(self, subsample_group, 'subsample_group', 'uint32')
+
     def get_label(self):
         """Get the label of the DMatrix.
 
@@ -735,6 +754,15 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         base_margin : float
         """
         return self.get_float_info('base_margin')
+
+    def get_subsample_group(self):
+        """Get the subsample group of the DMatrix.
+
+        Returns
+        -------
+        subsample_group : array
+        """
+        return self.get_uint_info('subsample_group')
 
     def num_row(self):
         """Get the number of rows in the DMatrix.
@@ -945,7 +973,8 @@ class DeviceQuantileDMatrix(DMatrix):
                  silent=False,
                  feature_names=None,
                  feature_types=None,
-                 nthread=None, max_bin=256):
+                 nthread=None, max_bin=256,
+                 subsample_group=None):
         self.max_bin = max_bin
         self.missing = missing if missing is not None else np.nan
         self.nthread = nthread if nthread is not None else 1
@@ -963,7 +992,8 @@ class DeviceQuantileDMatrix(DMatrix):
             label_lower_bound=None,
             label_upper_bound=None,
             feature_names=feature_names,
-            feature_types=feature_types)
+            feature_types=feature_types,
+            subsample_group=subsample_group)
         self.handle = handle
 
         self.feature_names = feature_names

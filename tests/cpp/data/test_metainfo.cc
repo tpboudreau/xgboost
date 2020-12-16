@@ -24,6 +24,13 @@ TEST(MetaInfo, GetSet) {
   info.SetInfo("weight", float2, xgboost::DataType::kFloat32, 2);
   EXPECT_EQ(info.GetWeight(1), 2.0f);
 
+  uint32_t subsample_groups[2] = {11U, 11U};
+  EXPECT_EQ(info.subsample_groups_.Size(), 0);
+  EXPECT_EQ(info.unique_subsample_groups_.size(), 0);
+  info.SetInfo("subsample_group", subsample_groups, xgboost::DataType::kUInt32, 2);
+  EXPECT_EQ(info.subsample_groups_.Size(), 2);
+  EXPECT_EQ(info.unique_subsample_groups_.size(), 1);
+
   uint32_t uint32_t2[2] = {1U, 2U};
   EXPECT_EQ(info.base_margin_.Size(), 0);
   info.SetInfo("base_margin", uint32_t2, xgboost::DataType::kUInt32, 2);
@@ -37,6 +44,23 @@ TEST(MetaInfo, GetSet) {
 
   info.Clear();
   ASSERT_EQ(info.group_ptr_.size(), 0);
+}
+
+TEST(MetaInfo, SubsampleGroupSelector) {
+  xgboost::MetaInfo info;
+  uint32_t subsample_groups[10] = {1U, 2U, 2U, 3U, 3U, 3U, 4U, 4U, 4U, 4U};
+  info.SetInfo("subsample_group", subsample_groups, xgboost::DataType::kUInt32, 10);
+  EXPECT_EQ(info.subsample_groups_.Size(), 10);
+  EXPECT_EQ(info.unique_subsample_groups_.size(), 4);
+  float subsample = +0.25;
+  auto selector = info.BuildSelector(subsample);
+  int count = 0;
+  for (uint32_t g = 1U; g <= 4U; ++g) {
+    count += ( selector->IsSelectedGroup(g) ? 1 : 0 );
+  }
+  EXPECT_EQ(count, 1);
+  const auto& selected = selector->GetSelectedGroups();
+  EXPECT_EQ(selected.size(), 1);
 }
 
 TEST(MetaInfo, GetSetFeature) {
@@ -76,10 +100,17 @@ TEST(MetaInfo, SaveLoadBinary) {
                      static float f = 0;
                      return f++;
                    };
+  auto integer_generator = []() {
+                     static uint32_t i = 0U;
+                     return ++i;
+                   };
   std::vector<float> values (kRows);
+  std::vector<uint32_t> integer_values (kRows);
   std::generate(values.begin(), values.end(), generator);
+  std::generate(integer_values.begin(), integer_values.end(), integer_generator);
   info.SetInfo("label", values.data(), xgboost::DataType::kFloat32, kRows);
   info.SetInfo("weight", values.data(), xgboost::DataType::kFloat32, kRows);
+  info.SetInfo("subsample_group", integer_values.data(), xgboost::DataType::kUInt32, kRows);
   info.SetInfo("base_margin", values.data(), xgboost::DataType::kFloat32, kRows);
 
   info.num_row_ = kRows;
@@ -122,6 +153,8 @@ TEST(MetaInfo, SaveLoadBinary) {
     EXPECT_EQ(inforead.labels_.HostVector(), info.labels_.HostVector());
     EXPECT_EQ(inforead.group_ptr_, info.group_ptr_);
     EXPECT_EQ(inforead.weights_.HostVector(), info.weights_.HostVector());
+    EXPECT_EQ(inforead.subsample_groups_.HostVector(), info.subsample_groups_.HostVector());
+    EXPECT_EQ(inforead.unique_subsample_groups_, info.unique_subsample_groups_);
     EXPECT_EQ(inforead.base_margin_.HostVector(), info.base_margin_.HostVector());
 
     EXPECT_EQ(inforead.feature_type_names.size(), kCols);

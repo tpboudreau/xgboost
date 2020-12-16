@@ -20,6 +20,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <set>
 
 namespace xgboost {
 // forward declare dmatrix.
@@ -39,13 +40,48 @@ enum class FeatureType : uint8_t {
   kCategorical
 };
 
+class SubsampleGroupSelector {
+ public:
+  static const size_t kMaximumVectorLookupSize = 16*1024;
+
+  SubsampleGroupSelector() = default;
+  virtual void SelectGroups(const std::vector<bst_subsample_group_t>& subsample_group_numbers,
+                            float subsample);
+  virtual const std::set<bst_subsample_group_t>& GetSelectedGroups() const {
+    return selected_subsample_groups_;
+  }
+  virtual bool IsSelectedGroup(bst_subsample_group_t group) const {
+    return selected_subsample_groups_.find(group) != selected_subsample_groups_.end();
+  }
+  virtual ~SubsampleGroupSelector() {}
+
+ protected:
+  std::set<bst_subsample_group_t> selected_subsample_groups_;
+};
+
+class VectorSubsampleGroupSelector : public SubsampleGroupSelector {
+ public:
+  VectorSubsampleGroupSelector() = default;
+  void SelectGroups(const std::vector<bst_subsample_group_t>& subsample_group_numbers,
+                    float subsample) override;
+  bool IsSelectedGroup(bst_subsample_group_t group) const override {
+    // CHECK(low_group_ <= group && group <= high_group_);
+    return selected_subsample_group_markers_[group - low_group_];
+  }
+
+ private:
+  std::vector<bool> selected_subsample_group_markers_;
+  bst_subsample_group_t low_group_;
+  bst_subsample_group_t high_group_;
+};
+
 /*!
  * \brief Meta information about dataset, always sit in memory.
  */
 class MetaInfo {
  public:
   /*! \brief number of data fields in MetaInfo */
-  static constexpr uint64_t kNumField = 11;
+  static constexpr uint64_t kNumField = 13;
 
   /*! \brief number of rows in the data */
   uint64_t num_row_{0};  // NOLINT
@@ -62,6 +98,10 @@ class MetaInfo {
   std::vector<bst_group_t> group_ptr_;  // NOLINT
   /*! \brief weights of each instance, optional */
   HostDeviceVector<bst_float> weights_;  // NOLINT
+  /*! \brief group number of each instance for grouped sampling, optional */
+  HostDeviceVector<bst_subsample_group_t> subsample_groups_;  // NOLINT
+  /*! \brief set of unique numbers found in subsample_groups_, optional */
+  std::vector<bst_subsample_group_t> unique_subsample_groups_;  // NOLINT
   /*!
    * \brief initialized margins,
    * if specified, xgboost will start from this init margin
@@ -114,6 +154,14 @@ class MetaInfo {
    */
   inline bst_float GetWeight(size_t i) const {
     return weights_.Size() != 0 ?  weights_.HostVector()[i] : 1.0f;
+  }
+  /*!
+   * \brief Get subsample group number of each instance.
+   * \param i Instance index.
+   * \return The subsample group number.
+   */
+  inline bst_subsample_group_t GetSubsampleGroup(size_t i) const {
+    return subsample_groups_.Size() != 0 ? subsample_groups_.HostVector()[i] : 0U;
   }
   /*! \brief get sorted indexes (argsort) of labels by absolute value (used by cox loss) */
   inline const std::vector<size_t>& LabelAbsSort() const {
@@ -174,6 +222,11 @@ class MetaInfo {
    *        client code knows number of rows in advance, set this parameter to false.
    */
   void Extend(MetaInfo const& that, bool accumulate_rows);
+
+  void ResetUniqueSubsampleGroups();
+
+  std::shared_ptr<SubsampleGroupSelector> BuildSelector(float subsample,
+      size_t maximum_size = SubsampleGroupSelector::kMaximumVectorLookupSize) const;
 
  private:
   /*! \brief argsort of labels */

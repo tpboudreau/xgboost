@@ -229,6 +229,11 @@ TEST(SimpleDMatrix, Slice) {
   size_t constexpr kCols {8};
   size_t constexpr kClasses {3};
   auto p_m = RandomDataGenerator{kRows, kCols, 0}.GenerateDMatrix(true);
+
+  auto& subsample_groups = p_m->Info().subsample_groups_.HostVector();
+  subsample_groups.resize(kRows);
+  std::iota(subsample_groups.begin(), subsample_groups.end(), 0U);
+
   auto& weights = p_m->Info().weights_.HostVector();
   weights.resize(kRows);
   std::iota(weights.begin(), weights.end(), 0.0f);
@@ -269,6 +274,8 @@ TEST(SimpleDMatrix, Slice) {
                   out->Info().labels_upper_bound_.HostVector().at(i));
         ASSERT_EQ(p_m->Info().weights_.HostVector().at(ridx),
                   out->Info().weights_.HostVector().at(i));
+        ASSERT_EQ(p_m->Info().subsample_groups_.HostVector().at(ridx),
+                  out->Info().subsample_groups_.HostVector().at(i));
 
         auto& out_margin = out->Info().base_margin_.HostVector();
         for (size_t j = 0; j < kClasses; ++j) {

@@ -280,7 +280,7 @@ def _transform_dt_df(data, feature_names, feature_types, meta=None,
     """Validate feature names and types if data table"""
     if meta and data.shape[1] > 1:
         raise ValueError(
-            'DataTable for label or weight cannot have multiple columns')
+            'DataTable for meta-info can not have multiple columns')
     if meta:
         # below requires new dt version
         # extract first column
@@ -716,7 +716,8 @@ class SingleBatchInternalIter(DataIter):  # pylint: disable=R0902
     '''
     def __init__(self, data, label, weight, base_margin, group,
                  label_lower_bound, label_upper_bound,
-                 feature_names, feature_types):
+                 feature_names, feature_types,
+                 subsample_group):
         self.data = data
         self.label = label
         self.weight = weight
@@ -726,6 +727,7 @@ class SingleBatchInternalIter(DataIter):  # pylint: disable=R0902
         self.label_upper_bound = label_upper_bound
         self.feature_names = feature_names
         self.feature_types = feature_types
+        self.subsample_group = subsample_group
         self.it = 0             # pylint: disable=invalid-name
         super().__init__()
 
@@ -739,7 +741,8 @@ class SingleBatchInternalIter(DataIter):  # pylint: disable=R0902
                    label_lower_bound=self.label_lower_bound,
                    label_upper_bound=self.label_upper_bound,
                    feature_names=self.feature_names,
-                   feature_types=self.feature_types)
+                   feature_types=self.feature_types,
+                   subsample_group=self.subsample_group)
         return 1
 
     def reset(self):

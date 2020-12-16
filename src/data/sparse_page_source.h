@@ -340,6 +340,11 @@ class SparsePageSource {
           weights.insert(weights.end(), batch.Weights(),
                          batch.Weights() + batch.Size());
         }
+        if (batch.SubsampleGroups() != nullptr) {
+          auto& subsample_groups = info.subsample_groups_.HostVector();
+          subsample_groups.insert(subsample_groups.end(), batch.SubsampleGroups(),
+                                  batch.SubsampleGroups() + batch.Size());
+        }
         if (batch.BaseMargin() != nullptr) {
           auto& base_margin = info.base_margin_.HostVector();
           base_margin.insert(base_margin.end(), batch.BaseMargin(),
@@ -366,6 +371,8 @@ class SparsePageSource {
         pool.Push(page);
         page->SetBaseRowId(inferred_num_rows);
       }
+
+      info.ResetUniqueSubsampleGroups();
 
       if (last_group_id != default_max) {
         if (group_size > info.group_ptr_.back()) {

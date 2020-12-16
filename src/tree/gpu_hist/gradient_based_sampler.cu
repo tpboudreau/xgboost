@@ -47,6 +47,51 @@ class BernoulliTrial : public thrust::unary_function<size_t, bool> {
   float p_;
 };
 
+/*! \brief A functor that performs a vector lookup to discard a gradient pair. */
+class SelectedGroupRowLookup : public thrust::unary_function<bst_subsample_group_t, bool> {
+ public:
+  explicit SelectedGroupRowLookup(common::Span<bool> sgm, bst_subsample_group_t lg) :
+    selected_group_markers_(sgm), low_group_(lg) {}
+
+  XGBOOST_DEVICE bool operator()(bst_subsample_group_t observed_group) const {
+    return !selected_group_markers_[observed_group - low_group_];
+  }
+
+ private:
+  common::Span<bool> selected_group_markers_;
+  bst_subsample_group_t low_group_;
+};
+
+/*! \brief A functor that performs a binary search to discard a gradient pair. */
+class SelectedGroupRowSearch : public thrust::unary_function<bst_subsample_group_t, bool> {
+ public:
+  explicit SelectedGroupRowSearch(common::Span<bst_subsample_group_t> sg) :
+     selected_groups_(sg) {}
+
+  XGBOOST_DEVICE bool operator()(bst_subsample_group_t observed_group) const {
+    bool found = false;
+    int lo = 0;
+    int hi = selected_groups_.size() - 1;
+    while (lo <= hi) {
+      int md = lo + (hi - lo) / 2;
+      if (selected_groups_[md] == observed_group) {
+        found = true;
+        break;
+      } else {
+        if (selected_groups_[md] < observed_group) {
+          lo = md + 1;
+        } else {
+          hi = md - 1;
+        }
+      }
+    }
+    return !found;
+  }
+
+ private:
+  common::Span<bst_subsample_group_t> selected_groups_;  // integers in ascending order
+};
+
 /*! \brief A functor that returns true if the gradient pair is non-zero. */
 struct IsNonZero : public thrust::unary_function<GradientPair, bool> {
   XGBOOST_DEVICE bool operator()(const GradientPair& gpair) const {
@@ -231,6 +276,110 @@ GradientBasedSample ExternalMemoryUniformSampling::Sample(common::Span<GradientP
   return {sample_rows, page_.get(), dh::ToSpan(gpair_)};
 }
 
+GroupedSampling::GroupedSampling(EllpackPageImpl* page, float subsample)
+    : page_(page), subsample_(subsample) {}
+
+GradientBasedSample GroupedSampling::Sample(common::Span<GradientPair> gpair, DMatrix* dmat) {
+  const MetaInfo& info = dmat->Info();
+  auto selector = info.BuildSelector(subsample_, 0);
+  const auto& sg = selector->GetSelectedGroups();
+  if (sg.size() <= SubsampleGroupSelector::kMaximumVectorLookupSize) {
+    // Use vector based lookup
+    selected_group_markers_.clear();
+    low_group_ = info.unique_subsample_groups_.front();
+    high_group_ = info.unique_subsample_groups_.back();
+    selected_group_markers_.resize((high_group_ - low_group_) + 1, false);
+    for (auto g : sg) {
+      selected_group_markers_[g - low_group_] = true;
+    }
+    thrust::replace_if(dh::tbegin(gpair),
+                       dh::tend(gpair),
+                       dh::tcbegin(info.subsample_groups_.ConstDeviceSpan()),
+                       SelectedGroupRowLookup(dh::ToSpan(selected_group_markers_), low_group_),
+                       GradientPair());
+  } else {
+    // Fall back to search based lookup
+    selected_groups_.clear();
+    selected_groups_.insert(selected_groups_.begin(), sg.cbegin(), sg.cend());
+    thrust::replace_if(dh::tbegin(gpair),
+                       dh::tend(gpair),
+                       dh::tcbegin(info.subsample_groups_.ConstDeviceSpan()),
+                       SelectedGroupRowSearch(dh::ToSpan(selected_groups_)),
+                       GradientPair());
+  }
+  return {dmat->Info().num_row_, page_, gpair};
+}
+
+ExternalMemoryGroupedSampling::ExternalMemoryGroupedSampling(EllpackPageImpl* page,
+                                                             size_t n_rows,
+                                                             const BatchParam& batch_param,
+                                                             float subsample)
+    : original_page_(page),
+      batch_param_(batch_param),
+      subsample_(subsample),
+      sample_row_index_(n_rows) {}
+
+GradientBasedSample ExternalMemoryGroupedSampling::Sample(common::Span<GradientPair> gpair,
+                                                          DMatrix* dmat) {
+  const MetaInfo& info = dmat->Info();
+  auto selector = info.BuildSelector(subsample_, 0);
+  const auto& sg = selector->GetSelectedGroups();
+  if (sg.size() <= SubsampleGroupSelector::kMaximumVectorLookupSize) {
+    // Use vector based lookup
+    selected_group_markers_.clear();
+    low_group_ = info.unique_subsample_groups_.front();
+    high_group_ = info.unique_subsample_groups_.back();
+    selected_group_markers_.resize((high_group_ - low_group_) + 1, false);
+    for (auto g : sg) {
+      selected_group_markers_[g - low_group_] = true;
+    }
+    thrust::replace_if(dh::tbegin(gpair),
+                       dh::tend(gpair),
+                       dh::tcbegin(info.subsample_groups_.ConstDeviceSpan()),
+                       SelectedGroupRowLookup(dh::ToSpan(selected_group_markers_), low_group_),
+                       GradientPair());
+  } else {
+    // Fall back to search based lookup
+    selected_groups_.clear();
+    selected_groups_.insert(selected_groups_.begin(), sg.cbegin(), sg.cend());
+    thrust::replace_if(dh::tbegin(gpair),
+                       dh::tend(gpair),
+                       dh::tcbegin(info.subsample_groups_.ConstDeviceSpan()),
+                       SelectedGroupRowSearch(dh::ToSpan(selected_groups_)),
+                       GradientPair());
+  }
+
+  // Count the sampled rows.
+  size_t sample_rows = thrust::count_if(dh::tbegin(gpair), dh::tend(gpair), IsNonZero());
+
+  // Compact gradient pairs.
+  gpair_.resize(sample_rows);
+  thrust::copy_if(dh::tbegin(gpair), dh::tend(gpair), gpair_.begin(), IsNonZero());
+
+  // Index the sample rows.
+  thrust::transform(dh::tbegin(gpair), dh::tend(gpair), sample_row_index_.begin(), IsNonZero());
+  thrust::exclusive_scan(sample_row_index_.begin(), sample_row_index_.end(),
+                         sample_row_index_.begin());
+  thrust::transform(dh::tbegin(gpair), dh::tend(gpair),
+                    sample_row_index_.begin(),
+                    sample_row_index_.begin(),
+                    ClearEmptyRows());
+
+  // Create a new ELLPACK page with empty rows.
+  page_.reset();  // Release the device memory first before reallocating
+  page_.reset(new EllpackPageImpl(
+      batch_param_.gpu_id, original_page_->Cuts(), original_page_->is_dense,
+                                  original_page_->row_stride, sample_rows));
+
+  // Compact the ELLPACK pages into the single sample page.
+  thrust::fill(dh::tbegin(page_->gidx_buffer), dh::tend(page_->gidx_buffer), 0);
+  for (auto& batch : dmat->GetBatches<EllpackPage>(batch_param_)) {
+    page_->Compact(batch_param_.gpu_id, batch.Impl(), dh::ToSpan(sample_row_index_));
+  }
+
+  return {sample_rows, page_.get(), dh::ToSpan(gpair_)};
+}
+
 GradientBasedSampling::GradientBasedSampling(EllpackPageImpl* page,
                                              size_t n_rows,
                                              const BatchParam&,
@@ -338,6 +487,13 @@ GradientBasedSampler::GradientBasedSampler(EllpackPageImpl* page,
               new ExternalMemoryGradientBasedSampling(page, n_rows, batch_param, subsample));
         } else {
           strategy_.reset(new GradientBasedSampling(page, n_rows, batch_param, subsample));
+        }
+        break;
+      case TrainParam::kGrouped:
+        if (is_external_memory) {
+          strategy_.reset(new ExternalMemoryGroupedSampling(page, n_rows, batch_param, subsample));
+        } else {
+          strategy_.reset(new GroupedSampling(page, subsample));
         }
         break;
       default:LOG(FATAL) << "unknown sampling method";

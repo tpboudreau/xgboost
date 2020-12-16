@@ -4,6 +4,10 @@
  */
 #include <dmlc/registry.h>
 #include <cstring>
+#include <sstream>
+#include <memory>
+#include <set>
+#include <vector>
 
 #include "dmlc/io.h"
 #include "xgboost/data.h"
@@ -20,6 +24,7 @@
 #include "../common/version.h"
 #include "../common/group_data.h"
 #include "../common/threading_utils.h"
+#include "../common/random.h"
 #include "../data/adapter.h"
 #include "../data/iterative_device_dmatrix.h"
 
@@ -127,6 +132,71 @@ void LoadVectorField(dmlc::Stream* strm, const std::string& expected_name,
 
 namespace xgboost {
 
+void SubsampleGroupSelector::SelectGroups(
+    const std::vector<bst_subsample_group_t>& unique_subsample_groups,
+    float subsample) {
+  CHECK_GT(unique_subsample_groups.size(), 0);
+  CHECK_GT(subsample, 0.0) << "subsample parameter must be in the range (0.0, 1.0]";
+  int64_t selected_group_count = 0;
+  if (subsample < 1.0) {
+    selected_group_count = std::lround(subsample *
+                                       static_cast<float>(unique_subsample_groups.size()));
+    // Make sure at least one subsample group is eliminated (subsample < 1.0)
+    selected_group_count = std::min(selected_group_count,
+                                    static_cast<int64_t>(unique_subsample_groups.size()) - 1);
+    // Make sure at least one subsample group is represented (subsample > 0.0)
+    selected_group_count = std::max(selected_group_count, 1L);
+  } else {
+    CHECK_EQ(subsample, 1.0) << "subsample parameter must be in the range (0.0, 1.0]";
+    selected_group_count = unique_subsample_groups.size();
+  }
+  CHECK_GT(selected_group_count, 0L);
+  // equality where only one group in data or subsample == 1.0 ...
+  CHECK_LE(selected_group_count, unique_subsample_groups.size());
+  LOG(INFO) << "grouped subsampling using " << selected_group_count
+            << " of " << unique_subsample_groups.size() << " groups";
+  selected_subsample_groups_.clear();
+  if (selected_group_count < unique_subsample_groups.size()) {
+    auto& generator = common::GlobalRandom();
+    std::uniform_int_distribution<> random_index(0, unique_subsample_groups.size() - 1);
+    for (int64_t i = 0; i < selected_group_count; ++i) {
+      auto result =
+          selected_subsample_groups_.insert(unique_subsample_groups[random_index(generator)]);
+      // retry if the same group number was randomly selected more than once;
+      // assumes there are no duplicates in unique_subsample_groups.
+      while (!result.second) {
+        result =
+          selected_subsample_groups_.insert(unique_subsample_groups[random_index(generator)]);
+      }
+    }
+  } else {
+    selected_subsample_groups_.insert(unique_subsample_groups.cbegin(),
+                                      unique_subsample_groups.cend());
+  }
+  CHECK_EQ(selected_group_count, selected_subsample_groups_.size());
+  std::stringstream groups;
+  for (bst_subsample_group_t g : selected_subsample_groups_) {groups << " " << g;}
+  LOG(INFO) << "selected subsample group numbers:" << groups.str();
+  return;
+}
+
+void VectorSubsampleGroupSelector::SelectGroups(
+    const std::vector<bst_subsample_group_t>& unique_subsample_groups,
+    float subsample) {
+  // populate selected_subsample_groups_ set as usual ...
+  SubsampleGroupSelector::SelectGroups(unique_subsample_groups, subsample);
+  // ... then translate to positional +1 (selected for sample) or -1 (not selected)
+  low_group_ = unique_subsample_groups.front();
+  high_group_ = unique_subsample_groups.back();
+  CHECK(low_group_ <= high_group_);
+  selected_subsample_group_markers_.clear();
+  selected_subsample_group_markers_.resize((high_group_ - low_group_) + 1, false);
+  for (auto g : selected_subsample_groups_) {
+    selected_subsample_group_markers_[g - low_group_] = true;
+  }
+  return;
+}
+
 uint64_t constexpr MetaInfo::kNumField;
 
 // implementation of inline functions
@@ -135,25 +205,72 @@ void MetaInfo::Clear() {
   labels_.HostVector().clear();
   group_ptr_.clear();
   weights_.HostVector().clear();
+  subsample_groups_.HostVector().clear();
+  unique_subsample_groups_.clear();
   base_margin_.HostVector().clear();
+}
+
+void MetaInfo::ResetUniqueSubsampleGroups() {
+  unique_subsample_groups_.clear();
+  auto& subsample_groups = subsample_groups_.HostVector();
+  if (subsample_groups.size() > 0) {
+    std::set<bst_subsample_group_t> unique_subsample_groups_set;
+    for (bst_subsample_group_t g : subsample_groups) {
+      unique_subsample_groups_set.insert(g);
+    }
+    unique_subsample_groups_.insert(unique_subsample_groups_.cbegin(),
+                                    unique_subsample_groups_set.cbegin(),
+                                    unique_subsample_groups_set.cend());
+  }
+  LOG(DEBUG) << "unique subsample group count: " << unique_subsample_groups_.size();
+  if (unique_subsample_groups_.size() > 0) {
+    std::stringstream groups;
+    for (bst_subsample_group_t g : unique_subsample_groups_) {groups << " " << g;}
+    LOG(DEBUG) << "unique subsample groups:" << groups.str();
+  }
+  return;
+}
+
+std::shared_ptr<SubsampleGroupSelector> MetaInfo::BuildSelector(float subsample,
+                                                             size_t maximum_size) const {
+  CHECK_GT(unique_subsample_groups_.size(), 0)
+    << "group number column must be provided for group based subsampling";
+  std::shared_ptr<SubsampleGroupSelector> selector;
+  int64_t required_size = (unique_subsample_groups_.back() - unique_subsample_groups_.front()) + 1;
+  CHECK_GT(required_size, 0);
+  LOG(DEBUG)
+    << "grouped subsampling vector size allowed: " << maximum_size
+    << ", required: " << required_size;
+  if (required_size > maximum_size) {
+    selector = std::make_shared<SubsampleGroupSelector>();
+    selector->SelectGroups(unique_subsample_groups_, subsample);
+  } else {
+    std::shared_ptr<VectorSubsampleGroupSelector> vector_selector =
+      std::make_shared<VectorSubsampleGroupSelector>();
+    vector_selector->SelectGroups(unique_subsample_groups_, subsample);
+    selector = std::dynamic_pointer_cast<SubsampleGroupSelector>(vector_selector);
+  }
+  return selector;
 }
 
 /*
  * Binary serialization format for MetaInfo:
  *
- * | name               | type     | is_scalar | num_row | num_col | value                   |
- * |--------------------+----------+-----------+---------+---------+-------------------------|
- * | num_row            | kUInt64  | True      | NA      |      NA | ${num_row_}             |
- * | num_col            | kUInt64  | True      | NA      |      NA | ${num_col_}             |
- * | num_nonzero        | kUInt64  | True      | NA      |      NA | ${num_nonzero_}         |
- * | labels             | kFloat32 | False     | ${size} |       1 | ${labels_}              |
- * | group_ptr          | kUInt32  | False     | ${size} |       1 | ${group_ptr_}           |
- * | weights            | kFloat32 | False     | ${size} |       1 | ${weights_}             |
- * | base_margin        | kFloat32 | False     | ${size} |       1 | ${base_margin_}         |
- * | labels_lower_bound | kFloat32 | False     | ${size} |       1 | ${labels_lower_bound_}  |
- * | labels_upper_bound | kFloat32 | False     | ${size} |       1 | ${labels_upper_bound_}  |
- * | feature_names      | kStr     | False     | ${size} |       1 | ${feature_names}        |
- * | feature_types      | kStr     | False     | ${size} |       1 | ${feature_types}        |
+ * | name                    | type     | is_scalar | num_row | num_col | value                       |
+ * |------------------=------+----------+-----------+---------+---------+-----------------------------|
+ * | num_row                 | kUInt64  | True      | NA      |      NA | ${num_row_}                 |
+ * | num_col                 | kUInt64  | True      | NA      |      NA | ${num_col_}                 |
+ * | num_nonzero             | kUInt64  | True      | NA      |      NA | ${num_nonzero_}             |
+ * | labels                  | kFloat32 | False     | ${size} |       1 | ${labels_}                  |
+ * | group_ptr               | kUInt32  | False     | ${size} |       1 | ${group_ptr_}               |
+ * | weights                 | kFloat32 | False     | ${size} |       1 | ${weights_}                 |
+ * | base_margin             | kFloat32 | False     | ${size} |       1 | ${base_margin_}             |
+ * | labels_lower_bound      | kFloat32 | False     | ${size} |       1 | ${labels_lower_bound_}      |
+ * | labels_upper_bound      | kFloat32 | False     | ${size} |       1 | ${labels_upper_bound_}      |
+ * | feature_names           | kStr     | False     | ${size} |       1 | ${feature_names}            |
+ * | feature_types           | kStr     | False     | ${size} |       1 | ${feature_types}            |
+ * | subsample_groups        | kUInt32  | False     | ${size} |       1 | ${subsample_groups_}        |
+ * | unique_subsample_groups | kUInt32  | False     | ${size} |       1 | ${unique_subsample_groups_} |
  *
  * Note that the scalar fields (is_scalar=True) will have num_row and num_col missing.
  * Also notice the difference between the saved name and the name used in `SetInfo':
@@ -186,6 +303,11 @@ void MetaInfo::SaveBinary(dmlc::Stream *fo) const {
   SaveVectorField(fo, u8"feature_types", DataType::kStr,
                   {feature_type_names.size(), 1}, feature_type_names); ++field_cnt;
 
+  SaveVectorField(fo, u8"subsample_groups", DataType::kUInt32,
+                  {subsample_groups_.Size(), 1}, subsample_groups_); ++field_cnt;
+  SaveVectorField(fo, u8"unique_subsample_groups", DataType::kUInt32,
+                  {unique_subsample_groups_.size(), 1}, unique_subsample_groups_); ++field_cnt;
+
   CHECK_EQ(field_cnt, kNumField) << "Wrong number of fields";
 }
 
@@ -211,6 +333,7 @@ void LoadFeatureType(std::vector<std::string>const& type_names, std::vector<Feat
 void MetaInfo::LoadBinary(dmlc::Stream *fi) {
   auto version = Version::Load(fi);
   auto major = std::get<0>(version);
+  auto minor = std::get<1>(version);
   // MetaInfo is saved in `SparsePageSource'.  So the version in MetaInfo represents the
   // version of DMatrix.
   CHECK_EQ(major, 1) << "Binary DMatrix generated by XGBoost: "
@@ -218,21 +341,23 @@ void MetaInfo::LoadBinary(dmlc::Stream *fi) {
                      << "Please process and save your data in current version: "
                      << Version::String(Version::Self()) << " again.";
 
-  const uint64_t expected_num_field = kNumField;
+  const uint64_t latest_expected_num_field = kNumField;
   uint64_t num_field { 0 };
   CHECK(fi->Read(&num_field)) << "MetaInfo: invalid format";
-  size_t expected = 0;
-  if (major == 1 && std::get<1>(version) < 2) {
-    // feature names and types are added in 1.2
-    expected = expected_num_field - 2;
-  } else {
-    expected = expected_num_field;
+  uint64_t version_expected_num_fields = latest_expected_num_field;
+  if (major == 1 && minor < 4) {
+    // subsample group and unique subsample group fields are added in 1.4
+    version_expected_num_fields -= 2;
   }
-  CHECK_GE(num_field, expected)
+  if (major == 1 && minor < 2) {
+    // feature names and types are added in 1.2
+    version_expected_num_fields -= 2;
+  }
+  CHECK_GE(num_field, version_expected_num_fields)
       << "MetaInfo: insufficient number of fields (expected at least "
-      << expected << " fields, but the binary file only contains " << num_field
-      << "fields.)";
-  if (num_field > expected_num_field) {
+      << version_expected_num_fields << " fields, but the binary file only contains "
+      << num_field << "fields.)";
+  if (num_field > latest_expected_num_field) {
     LOG(WARNING) << "MetaInfo: the given binary file contains extra fields "
                     "which will be ignored.";
   }
@@ -250,6 +375,11 @@ void MetaInfo::LoadBinary(dmlc::Stream *fi) {
   LoadVectorField(fi, u8"feature_names", DataType::kStr, &feature_names);
   LoadVectorField(fi, u8"feature_types", DataType::kStr, &feature_type_names);
   LoadFeatureType(feature_type_names, &feature_types.HostVector());
+
+  LoadVectorField(fi, u8"subsample_groups", DataType::kUInt32, &subsample_groups_);
+  LoadVectorField(fi, u8"unique_subsample_groups", DataType::kUInt32, &unique_subsample_groups_);
+
+  return;
 }
 
 template <typename T>
@@ -286,6 +416,17 @@ MetaInfo MetaInfo::Slice(common::Span<int32_t const> ridxs) const {
     out.weights_.HostVector() = h_weights;
   } else {
     out.weights_.HostVector() = Gather(this->weights_.HostVector(), ridxs);
+  }
+  // subsample_groups
+  if (this->subsample_groups_.Size() + 1 == this->group_ptr_.size()) {
+    // Assuming all groups are available.
+    out.subsample_groups_.HostVector() = this->subsample_groups_.HostVector();
+    out.unique_subsample_groups_.insert(out.unique_subsample_groups_.begin(),
+                                        this->unique_subsample_groups_.cbegin(),
+                                        this->unique_subsample_groups_.cend());
+  } else {
+    out.subsample_groups_.HostVector() = Gather(this->subsample_groups_.HostVector(), ridxs);
+    out.ResetUniqueSubsampleGroups();
   }
 
   if (this->base_margin_.Size() != this->num_row_) {
@@ -368,6 +509,12 @@ void MetaInfo::SetInfo(const char* key, const void* dptr, DataType dtype, size_t
     auto valid = std::all_of(weights.cbegin(), weights.cend(),
                              [](float w) { return w >= 0; });
     CHECK(valid) << "Weights must be positive values.";
+  } else if (!std::strcmp(key, "subsample_group")) {
+    auto& subsample_groups = subsample_groups_.HostVector();
+    subsample_groups.resize(num);
+    DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
+                       std::copy(cast_dptr, cast_dptr + num, subsample_groups.begin()));
+    ResetUniqueSubsampleGroups();
   } else if (!std::strcmp(key, "base_margin")) {
     auto& base_margin = base_margin_.HostVector();
     base_margin.resize(num);
@@ -431,6 +578,8 @@ void MetaInfo::GetInfo(char const *key, bst_ulong *out_len, DataType dtype,
     const std::vector<unsigned> *vec = nullptr;
     if (!std::strcmp(key, "group_ptr")) {
       vec = &this->group_ptr_;
+    } else if (!std::strcmp(key, "subsample_group")) {
+      vec = &this->subsample_groups_.HostVector();
     } else {
       LOG(FATAL) << "Unknown uint32 field name: " << key;
     }
@@ -494,6 +643,10 @@ void MetaInfo::Extend(MetaInfo const& that, bool accumulate_rows) {
   this->weights_.SetDevice(that.weights_.DeviceIdx());
   this->weights_.Extend(that.weights_);
 
+  this->subsample_groups_.SetDevice(that.subsample_groups_.DeviceIdx());
+  this->subsample_groups_.Extend(that.subsample_groups_);
+  this->ResetUniqueSubsampleGroups();
+
   this->labels_lower_bound_.SetDevice(that.labels_lower_bound_.DeviceIdx());
   this->labels_lower_bound_.Extend(that.labels_lower_bound_);
 
@@ -542,49 +695,64 @@ void MetaInfo::Validate(int32_t device) const {
         << "Invalid group structure.  Number of rows obtained from groups "
            "doesn't equal to actual number of rows given by data.";
   }
-  auto check_device = [device](HostDeviceVector<float> const &v) {
+  auto check_device_float = [device](HostDeviceVector<float> const &v) {
     CHECK(v.DeviceIdx() == GenericParameter::kCpuId ||
-          device  == GenericParameter::kCpuId ||
+          device == GenericParameter::kCpuId ||
           v.DeviceIdx() == device)
-        << "Data is resided on a different device than `gpu_id`. "
+        << "Data resides on a different device than `gpu_id`. "
+        << "Device that data is on: " << v.DeviceIdx() << ", "
+        << "`gpu_id` for XGBoost: " << device;
+  };
+
+  auto check_device_uint32_t = [device](HostDeviceVector<uint32_t> const &v) {
+    CHECK(v.DeviceIdx() == GenericParameter::kCpuId ||
+          device == GenericParameter::kCpuId ||
+          v.DeviceIdx() == device)
+        << "Data resides on a different device than `gpu_id`. "
         << "Device that data is on: " << v.DeviceIdx() << ", "
         << "`gpu_id` for XGBoost: " << device;
   };
 
   if (weights_.Size() != 0) {
     CHECK_EQ(weights_.Size(), num_row_)
-        << "Size of weights must equal to number of rows.";
-    check_device(weights_);
+        << "Size of weights must be equal to number of rows.";
+    check_device_float(weights_);
+    return;
+  }
+  if (subsample_groups_.Size() != 0) {
+    CHECK_EQ(subsample_groups_.Size(), num_row_)
+        << "Size of subsample groups must be equal to number of rows.";
+    check_device_uint32_t(subsample_groups_);
     return;
   }
   if (labels_.Size() != 0) {
     CHECK_EQ(labels_.Size(), num_row_)
         << "Size of labels must equal to number of rows.";
-    check_device(labels_);
+    check_device_float(labels_);
     return;
   }
   if (labels_lower_bound_.Size() != 0) {
     CHECK_EQ(labels_lower_bound_.Size(), num_row_)
         << "Size of label_lower_bound must equal to number of rows.";
-    check_device(labels_lower_bound_);
+    check_device_float(labels_lower_bound_);
     return;
   }
   if (feature_weigths.Size() != 0) {
     CHECK_EQ(feature_weigths.Size(), num_col_)
         << "Size of feature_weights must equal to number of columns.";
-    check_device(feature_weigths);
+    check_device_float(feature_weigths);
   }
   if (labels_upper_bound_.Size() != 0) {
     CHECK_EQ(labels_upper_bound_.Size(), num_row_)
         << "Size of label_upper_bound must equal to number of rows.";
-    check_device(labels_upper_bound_);
+    check_device_float(labels_upper_bound_);
     return;
   }
   CHECK_LE(num_nonzero_, num_col_ * num_row_);
   if (base_margin_.Size() != 0) {
     CHECK_EQ(base_margin_.Size() % num_row_, 0)
         << "Size of base margin must be a multiple of number of rows.";
-    check_device(base_margin_);
+    check_device_float(base_margin_);
   }
 }
 
