@@ -84,6 +84,10 @@ void MetaInfo::SetInfo(const char * c_key, std::string const& interface_str) {
 
   if (key == "label") {
     CopyInfoImpl(array_interface, &labels_);
+  } else if (key == "alternate_label") {
+    // TODO(tpb) -- host side reset only
+  } else if (key == "alternate_label_weights") {
+    // TODO(tpb) -- host side reset and validity check only
   } else if (key == "weight") {
     CopyInfoImpl(array_interface, &weights_);
     auto ptr = weights_.ConstDevicePointer();

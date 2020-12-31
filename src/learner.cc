@@ -993,6 +993,12 @@ class LearnerImpl : public LearnerIO {
     if (generic_parameters_.seed_per_iteration || rabit::IsDistributed()) {
       common::GlobalRandom().seed(generic_parameters_.seed * kRandSeedMagic + iter);
     }
+
+    //LOG(CONSOLE) << "TPB UpdateOneIter()";
+    auto& info = train->Info();
+    if (!info.alternate_labels_.empty()) {
+      info.ResetLabels();
+    }
     this->CheckDataSplitMode();
     this->ValidateDMatrix(train.get(), true);
 
@@ -1020,6 +1026,7 @@ class LearnerImpl : public LearnerIO {
     if (generic_parameters_.seed_per_iteration || rabit::IsDistributed()) {
       common::GlobalRandom().seed(generic_parameters_.seed * kRandSeedMagic + iter);
     }
+    //LOG(CONSOLE) << "TPB BoostOneIter()";
     this->CheckDataSplitMode();
     this->ValidateDMatrix(train.get(), true);
     auto local_cache = this->GetPredictionCache();
@@ -1057,6 +1064,8 @@ class LearnerImpl : public LearnerIO {
     auto local_cache = this->GetPredictionCache();
     for (size_t i = 0; i < data_sets.size(); ++i) {
       std::shared_ptr<DMatrix> m = data_sets[i];
+      //LOG(CONSOLE) << "TPB EvalOneIter()";
+      // TODO(tpb) -- decide whether alternating labels (m->Info().ResetLabels()) are appropriate here
       auto &predt = local_cache->Cache(m, generic_parameters_.gpu_id);
       this->ValidateDMatrix(m.get(), false);
       this->PredictRaw(m.get(), &predt, false);

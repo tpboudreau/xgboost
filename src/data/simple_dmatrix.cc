@@ -102,8 +102,9 @@ SimpleDMatrix::SimpleDMatrix(AdapterT* adapter, float missing, int nthread) {
   auto& offset_vec = sparse_page_.offset.HostVector();
   auto& data_vec = sparse_page_.data.HostVector();
   uint64_t inferred_num_columns = 0;
+  // batch_size is either number of rows or cols, depending on data layout
   uint64_t total_batch_size = 0;
-    // batch_size is either number of rows or cols, depending on data layout
+  size_t label_count = 0;
 
   adapter->BeforeFirst();
   // Iterate over batches of input data
@@ -112,11 +113,24 @@ SimpleDMatrix::SimpleDMatrix(AdapterT* adapter, float missing, int nthread) {
     auto batch_max_columns = sparse_page_.Push(batch, missing, nthread);
     inferred_num_columns = std::max(batch_max_columns, inferred_num_columns);
     total_batch_size += batch.Size();
+
     // Append meta information if available
+    if (label_count == 0) {
+      label_count = batch.LabelCount();
+    }
+    CHECK_EQ(label_count, batch.LabelCount())
+        << "Label count for all batches must be the same";
+    info_.num_alternate_labels_ = (label_count > 1 ? label_count : 0);
+
     if (batch.Labels() != nullptr) {
-      auto& labels = info_.labels_.HostVector();
-      labels.insert(labels.end(), batch.Labels(),
-                    batch.Labels() + batch.Size());
+      if (info_.num_alternate_labels_ == 0) {
+        auto& labels = info_.labels_.HostVector();
+        labels.insert(labels.end(), batch.Labels(),
+                      batch.Labels() + batch.Size());
+      } else {
+        info_.alternate_labels_.insert(info_.alternate_labels_.end(), batch.Labels(),
+                                       batch.Labels() + (batch.Size() * batch.LabelCount()));
+      }
     }
     if (batch.Weights() != nullptr) {
       auto& weights = info_.weights_.HostVector();
@@ -185,7 +199,20 @@ SimpleDMatrix::SimpleDMatrix(AdapterT* adapter, float missing, int nthread) {
     info_.num_row_ = adapter->NumRows();
   }
   info_.num_nonzero_ = data_vec.size();
+
+  // Either labels or alternate_labels is populated, but not both
+  CHECK_NE(info_.num_alternate_labels_, 1);
+  CHECK((info_.num_alternate_labels_ == 0 &&
+         (info_.labels_.Size() == 0 || info_.labels_.Size() == info_.num_row_) &&
+         info_.alternate_labels_.size() == 0)
+       ||
+        (info_.num_alternate_labels_ > 1 &&
+         info_.labels_.Size() == 0 &&
+         info_.alternate_labels_.size() == (info_.num_row_ * info_.num_alternate_labels_))
+       );
+
   omp_set_num_threads(nthread_original);
+  return;
 }
 
 SimpleDMatrix::SimpleDMatrix(dmlc::Stream* in_stream) {

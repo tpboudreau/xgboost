@@ -323,7 +323,9 @@ class DataIter:
                         group=None,
                         label_lower_bound=None, label_upper_bound=None,
                         feature_names=None, feature_types=None,
-                        feature_weights=None):
+                        feature_weights=None,
+                        alternate_label=None,
+                        alternate_label_weights=None):
             from .data import dispatch_device_quantile_dmatrix_set_data
             from .data import _device_quantile_transform
             data, feature_names, feature_types = _device_quantile_transform(
@@ -337,7 +339,9 @@ class DataIter:
                                 label_upper_bound=label_upper_bound,
                                 feature_names=feature_names,
                                 feature_types=feature_types,
-                                feature_weights=feature_weights)
+                                feature_weights=feature_weights,
+                                alternate_label=alternate_label,
+                                alternate_label_weights=alternate_label_weights)
         try:
             # Differ the exception in order to return 0 and stop the iteration.
             # Exception inside a ctype callback function has no effect except
@@ -439,7 +443,9 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
                  feature_names=None,
                  feature_types=None,
                  nthread=None,
-                 enable_categorical=False):
+                 enable_categorical=False,
+                 alternate_label=None,
+                 alternate_label_weights=None):
         """Parameters
         ----------
         data : os.PathLike/string/numpy.array/scipy.sparse/pd.DataFrame/
@@ -484,6 +490,10 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
             rest (one hot) categorical split.  Also, JSON serialization format,
             `gpu_predictor` and pandas input are required.
 
+        alternate_label : list of lists, numpy array or cudf.DataFrame, optional
+            Alternate labels of the training data.
+        alternate_label_weights : list, numpy 1-D array or cudf.DataFrame , optional
+            Weight for each alternate label.
         """
         if isinstance(data, list):
             raise TypeError('Input data can not be a list.')
@@ -507,7 +517,10 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         assert handle is not None
         self.handle = handle
 
-        self.set_info(label=label, weight=weight, base_margin=base_margin)
+        # TODO(tpb) set_info() one of (a) label or
+        # (b) alternate_label/alternate_label_weights, not both
+        self.set_info(label=label, weight=weight, base_margin=base_margin,
+                      alternate_label_weights=alternate_label_weights)
 
         if feature_names is not None:
             self.feature_names = feature_names
@@ -527,7 +540,9 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
                  label_upper_bound=None,
                  feature_names=None,
                  feature_types=None,
-                 feature_weights=None):
+                 feature_weights=None,
+                 alternate_label=None,
+                 alternate_label_weights=None):
         '''Set meta info for DMatrix.'''
         if label is not None:
             self.set_label(label)
@@ -549,6 +564,11 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
             from .data import dispatch_meta_backend
             dispatch_meta_backend(matrix=self, data=feature_weights,
                                   name='feature_weights')
+        if alternate_label is not None:
+            self.set_alternate_label(alternate_label)
+        if alternate_label_weights is not None:
+            self.set_float_info('alternate_label_weights',
+                                alternate_label_weights)
 
     def get_float_info(self, field):
         """Get float property from the DMatrix.
@@ -709,6 +729,30 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         from .data import dispatch_meta_backend
         dispatch_meta_backend(self, group, 'group', 'uint32')
 
+    def set_alternate_label(self, alternate_label):
+        """Set alternate labels of the Dmatrix
+
+        Parameters
+        ----------
+        alternate_label: array of array like
+            The set of alternate labels for the DMatrix
+        """
+        #from .data import dispatch_meta_backend
+        #dispatch_meta_backend(self, label, 'alternate_label', 'float')
+        raise NotImplementedError()
+
+    def set_alternate_label_weights(self, alternate_label_weights):
+        """Set weights for alternate labels in the DMatrix
+
+        Parameters
+        ----------
+        alternate_label_weights: array like
+            The weight for each alternate label in the DMatrix
+        """
+        from .data import dispatch_meta_backend
+        dispatch_meta_backend(self, alternate_label_weights,
+                              'alternate_label_weights', 'float')
+
     def get_label(self):
         """Get the label of the DMatrix.
 
@@ -726,6 +770,25 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         weight : array
         """
         return self.get_float_info('weight')
+
+    def get_alternate_label(self):
+        """Get the alternate labels of the DMatrix.
+
+        Returns
+        -------
+        alternate_label : list of array
+        """
+        #a = self.get_float_info('alternate_label')
+        raise NotImplementedError()
+
+    def get_alternate_label_weights(self):
+        """Get the weights for each alternate label of the DMatrix.
+
+        Returns
+        -------
+        alternate_label_weights : array
+        """
+        return self.get_float_info('alternate_label_weights')
 
     def get_base_margin(self):
         """Get the base margin of the DMatrix.
@@ -945,6 +1008,8 @@ class DeviceQuantileDMatrix(DMatrix):
                  silent=False,
                  feature_names=None,
                  feature_types=None,
+                 alternate_label=None,
+                 alternate_label_weights=None,
                  nthread=None, max_bin=256):
         self.max_bin = max_bin
         self.missing = missing if missing is not None else np.nan
@@ -963,7 +1028,9 @@ class DeviceQuantileDMatrix(DMatrix):
             label_lower_bound=None,
             label_upper_bound=None,
             feature_names=feature_names,
-            feature_types=feature_types)
+            feature_types=feature_types,
+            alternate_label=alternate_label,
+            alternate_label_weights=alternate_label_weights)
         self.handle = handle
 
         self.feature_names = feature_names

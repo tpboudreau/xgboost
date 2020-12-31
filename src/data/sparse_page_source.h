@@ -327,13 +327,26 @@ class SparsePageSource {
       uint64_t last_group_id = default_max;
       bst_uint group_size = 0;
       std::vector<uint64_t> qids;
+      size_t label_count = 0;
       adapter->BeforeFirst();
       while (adapter->Next()) {
         auto& batch = adapter->Value();
+
+        if (label_count == 0) {
+          label_count = batch.LabelCount();
+        }
+        CHECK_EQ(label_count, batch.LabelCount())
+            << "Label count for all batches must be the same";
+        info.num_alternate_labels_ = (label_count > 1 ? label_count : 0);
         if (batch.Labels() != nullptr) {
-          auto& labels = info.labels_.HostVector();
-          labels.insert(labels.end(), batch.Labels(),
-                        batch.Labels() + batch.Size());
+          if (info.num_alternate_labels_ == 0) {
+            auto& labels = info.labels_.HostVector();
+            labels.insert(labels.end(), batch.Labels(),
+                          batch.Labels() + batch.Size());
+          } else {
+            info.alternate_labels_.insert(info.alternate_labels_.end(), batch.Labels(),
+                                          batch.Labels() + (batch.Size() * batch.LabelCount()));
+          }
         }
         if (batch.Weights() != nullptr) {
           auto& weights = info.weights_.HostVector();
@@ -404,6 +417,16 @@ class SparsePageSource {
           dmlc::Stream::Create(cache_info_.name_info.c_str(), "w"));
       int tmagic = kMagic;
       fo->Write(tmagic);
+      // Either labels or alternate_labels is populated, but not both
+      CHECK_NE(info.num_alternate_labels_, 1);
+      CHECK((info.num_alternate_labels_ == 0 &&
+             (info.labels_.Size() == 0 || info.labels_.Size() == info.num_row_) &&
+             info.alternate_labels_.size() == 0)
+           ||
+            (info.num_alternate_labels_ > 1 &&
+             info.labels_.Size() == 0 &&
+             info.alternate_labels_.size() == (info.num_row_ * info.num_alternate_labels_))
+           );
       // Either every row has query ID or none at all
       CHECK(qids.empty() || qids.size() == info.num_row_);
       info.SaveBinary(fo.get());

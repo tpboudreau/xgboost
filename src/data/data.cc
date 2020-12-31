@@ -20,6 +20,7 @@
 #include "../common/version.h"
 #include "../common/group_data.h"
 #include "../common/threading_utils.h"
+#include "../common/random.h"
 #include "../data/adapter.h"
 #include "../data/iterative_device_dmatrix.h"
 
@@ -127,12 +128,78 @@ void LoadVectorField(dmlc::Stream* strm, const std::string& expected_name,
 
 namespace xgboost {
 
+static constexpr float kTotalSlots = 1000;
+
+void MetaInfo::ResetLabels() {
+  CHECK_GT(num_alternate_labels_, 0);
+  CHECK_GT(alternate_labels_.size(), 0);
+  CHECK_EQ(alternate_labels_.size() % num_alternate_labels_, 0);
+  CHECK_EQ(alternate_labels_.size() / num_alternate_labels_, num_row_);
+  CHECK(alternate_label_weights_.size() == 0 ||
+        alternate_label_weights_.size() == num_alternate_labels_);
+
+  float sum_weights = +0.0;
+  for (auto s : alternate_label_weights_) {
+    CHECK_GE(s, +0.0) << "alternate label weights must be non-negative";
+    sum_weights += s;
+  }
+
+  int active_label_index = 0;
+  int active_label_count = 0;
+  std::vector<size_t> slots;
+  if (sum_weights > 0.0) {
+    size_t i = 0;
+    for (auto s : alternate_label_weights_) {
+      int slot_count = static_cast<int>(std::roundf( ( s / sum_weights ) * kTotalSlots));
+      if (slot_count > 0) {
+        active_label_index = i;
+        active_label_count++;
+      }
+      slots.insert(slots.cend(), slot_count, i++);
+    }
+  }
+
+  // If no label weights were given, or all label weights were zero,
+  // use uniform random selection
+  if (slots.empty()) {
+    active_label_count = num_alternate_labels_;
+    slots.resize(num_alternate_labels_);
+    std::iota(slots.begin(), slots.end(), 0);
+  }
+
+  LOG(INFO) << "Reconstructing operative labels using "
+            << active_label_count << " of " << num_alternate_labels_
+            << " alternate labels";
+
+  size_t num_row = alternate_labels_.size() / num_alternate_labels_;
+  auto& labels = labels_.HostVector();
+  labels.resize(num_row);
+  if (active_label_count > 1) {
+    auto& generator = common::GlobalRandom();
+    std::uniform_int_distribution<> random_index(0, slots.size() - 1);
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < num_row; ++r) {
+      labels[r] = alternate_labels_[(r * num_alternate_labels_) + slots[random_index(generator)]];
+    }
+  } else {
+    // Avoid expensive random number generation if only one label index can be selected
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < num_row; ++r) {
+      labels[r] = alternate_labels_[(r * num_alternate_labels_) + active_label_index];
+    }
+  }
+
+  return;
+}
+
 uint64_t constexpr MetaInfo::kNumField;
 
 // implementation of inline functions
 void MetaInfo::Clear() {
-  num_row_ = num_col_ = num_nonzero_ = 0;
+  num_row_ = num_col_ = num_nonzero_ = num_alternate_labels_ = 0;
   labels_.HostVector().clear();
+  alternate_labels_.clear();
+  alternate_label_weights_.clear();
   group_ptr_.clear();
   weights_.HostVector().clear();
   base_margin_.HostVector().clear();
@@ -141,19 +208,23 @@ void MetaInfo::Clear() {
 /*
  * Binary serialization format for MetaInfo:
  *
- * | name               | type     | is_scalar | num_row | num_col | value                   |
- * |--------------------+----------+-----------+---------+---------+-------------------------|
- * | num_row            | kUInt64  | True      | NA      |      NA | ${num_row_}             |
- * | num_col            | kUInt64  | True      | NA      |      NA | ${num_col_}             |
- * | num_nonzero        | kUInt64  | True      | NA      |      NA | ${num_nonzero_}         |
- * | labels             | kFloat32 | False     | ${size} |       1 | ${labels_}              |
- * | group_ptr          | kUInt32  | False     | ${size} |       1 | ${group_ptr_}           |
- * | weights            | kFloat32 | False     | ${size} |       1 | ${weights_}             |
- * | base_margin        | kFloat32 | False     | ${size} |       1 | ${base_margin_}         |
- * | labels_lower_bound | kFloat32 | False     | ${size} |       1 | ${labels_lower_bound_}  |
- * | labels_upper_bound | kFloat32 | False     | ${size} |       1 | ${labels_upper_bound_}  |
- * | feature_names      | kStr     | False     | ${size} |       1 | ${feature_names}        |
- * | feature_types      | kStr     | False     | ${size} |       1 | ${feature_types}        |
+ * |-------------------------+----------+-----------+---------+---------+-----------------------------|
+ * | name                    | type     | is_scalar | num_row | num_col | value                       |
+ * |-------------------------+----------+-----------+---------+---------+-----------------------------|
+ * | num_row                 | kUInt64  | True      | NA      |      NA | ${num_row_}                 |
+ * | num_col                 | kUInt64  | True      | NA      |      NA | ${num_col_}                 |
+ * | num_nonzero             | kUInt64  | True      | NA      |      NA | ${num_nonzero_}             |
+ * | labels                  | kFloat32 | False     | ${size} |       1 | ${labels_}                  |
+ * | group_ptr               | kUInt32  | False     | ${size} |       1 | ${group_ptr_}               |
+ * | weights                 | kFloat32 | False     | ${size} |       1 | ${weights_}                 |
+ * | base_margin             | kFloat32 | False     | ${size} |       1 | ${base_margin_}             |
+ * | labels_lower_bound      | kFloat32 | False     | ${size} |       1 | ${labels_lower_bound_}      |
+ * | labels_upper_bound      | kFloat32 | False     | ${size} |       1 | ${labels_upper_bound_}      |
+ * | feature_names           | kStr     | False     | ${size} |       1 | ${feature_names}            |
+ * | feature_types           | kStr     | False     | ${size} |       1 | ${feature_types}            |
+ * | num_alternate_labels    | kUInt64  | True      | NA      |      NA | ${num_alternate_labels_}    |
+ * | alternate_labels        | kFloat32 | False     | ${size} |       1 | ${alternate_labels_}        |
+ * |-------------------------+----------+-----------+---------+---------+-----------------------------|
  *
  * Note that the scalar fields (is_scalar=True) will have num_row and num_col missing.
  * Also notice the difference between the saved name and the name used in `SetInfo':
@@ -186,6 +257,11 @@ void MetaInfo::SaveBinary(dmlc::Stream *fo) const {
   SaveVectorField(fo, u8"feature_types", DataType::kStr,
                   {feature_type_names.size(), 1}, feature_type_names); ++field_cnt;
 
+  SaveScalarField(fo, u8"num_alternate_labels", DataType::kUInt64,
+                  num_alternate_labels_); ++field_cnt;
+  SaveVectorField(fo, u8"alternate_labels", DataType::kFloat32,
+                  {alternate_labels_.size(), 1}, alternate_labels_); ++field_cnt;
+
   CHECK_EQ(field_cnt, kNumField) << "Wrong number of fields";
 }
 
@@ -211,6 +287,7 @@ void LoadFeatureType(std::vector<std::string>const& type_names, std::vector<Feat
 void MetaInfo::LoadBinary(dmlc::Stream *fi) {
   auto version = Version::Load(fi);
   auto major = std::get<0>(version);
+  auto minor = std::get<1>(version);
   // MetaInfo is saved in `SparsePageSource'.  So the version in MetaInfo represents the
   // version of DMatrix.
   CHECK_EQ(major, 1) << "Binary DMatrix generated by XGBoost: "
@@ -218,21 +295,23 @@ void MetaInfo::LoadBinary(dmlc::Stream *fi) {
                      << "Please process and save your data in current version: "
                      << Version::String(Version::Self()) << " again.";
 
-  const uint64_t expected_num_field = kNumField;
+  const uint64_t latest_expected_num_field = kNumField;
   uint64_t num_field { 0 };
   CHECK(fi->Read(&num_field)) << "MetaInfo: invalid format";
-  size_t expected = 0;
-  if (major == 1 && std::get<1>(version) < 2) {
-    // feature names and types are added in 1.2
-    expected = expected_num_field - 2;
-  } else {
-    expected = expected_num_field;
+  uint64_t version_expected_num_fields = latest_expected_num_field;
+  if (major == 1 && minor < 4) {
+    // alternate labels and count are added in 1.4
+    version_expected_num_fields -= 2;
   }
-  CHECK_GE(num_field, expected)
+  if (major == 1 && minor < 2) {
+    // feature names and types are added in 1.2
+    version_expected_num_fields -= 2;
+  }
+  CHECK_GE(num_field, version_expected_num_fields)
       << "MetaInfo: insufficient number of fields (expected at least "
-      << expected << " fields, but the binary file only contains " << num_field
-      << "fields.)";
-  if (num_field > expected_num_field) {
+      << version_expected_num_fields << " fields, but the binary file only contains "
+      << num_field << "fields.)";
+  if (num_field > latest_expected_num_field) {
     LOG(WARNING) << "MetaInfo: the given binary file contains extra fields "
                     "which will be ignored.";
   }
@@ -250,6 +329,11 @@ void MetaInfo::LoadBinary(dmlc::Stream *fi) {
   LoadVectorField(fi, u8"feature_names", DataType::kStr, &feature_names);
   LoadVectorField(fi, u8"feature_types", DataType::kStr, &feature_type_names);
   LoadFeatureType(feature_type_names, &feature_types.HostVector());
+
+  LoadScalarField(fi, u8"num_alternate_labels", DataType::kUInt64, &num_alternate_labels_);
+  LoadVectorField(fi, u8"alternate_labels", DataType::kFloat32, &alternate_labels_);
+
+  return;
 }
 
 template <typename T>
@@ -275,6 +359,14 @@ MetaInfo MetaInfo::Slice(common::Span<int32_t const> ridxs) const {
   // Groups is maintained by a higher level Python function.  We should aim at deprecating
   // the slice function.
   out.labels_.HostVector() = Gather(this->labels_.HostVector(), ridxs);
+
+  out.num_alternate_labels_ = this->num_alternate_labels_;
+  // TODO(tpb) -- slice the alternate_labels_; think about Gather given flattened array
+  out.alternate_label_weights_.resize(this->alternate_label_weights_.size());
+  std::copy(this->alternate_label_weights_.cbegin(),
+            this->alternate_label_weights_.cend(),
+            out.alternate_label_weights_.begin());
+
   out.labels_upper_bound_.HostVector() =
       Gather(this->labels_upper_bound_.HostVector(), ridxs);
   out.labels_lower_bound_.HostVector() =
@@ -360,6 +452,21 @@ void MetaInfo::SetInfo(const char* key, const void* dptr, DataType dtype, size_t
     labels.resize(num);
     DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
                        std::copy(cast_dptr, cast_dptr + num, labels.begin()));
+  } else if (!std::strcmp(key, "alternate_label")) {
+    alternate_labels_.resize(num);
+    DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
+                       std::copy(cast_dptr, cast_dptr + num,
+                                 alternate_labels_.begin()));
+    if (num == 0) num_alternate_labels_ = 0;
+  } else if (!std::strcmp(key, "alternate_label_weights")) {
+    alternate_label_weights_.resize(num);
+    DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
+                       std::copy(cast_dptr, cast_dptr + num, alternate_label_weights_.begin()));
+    auto valid = std::all_of(alternate_label_weights_.cbegin(),
+                             alternate_label_weights_.cend(),
+                             [](float s) { return s >= 0.0; });
+    CHECK(valid) << "Alternate label weights must be non-negative values.";
+    if (num > 0) num_alternate_labels_ = num;
   } else if (!std::strcmp(key, "weight")) {
     auto& weights = weights_.HostVector();
     weights.resize(num);
@@ -412,6 +519,10 @@ void MetaInfo::GetInfo(char const *key, bst_ulong *out_len, DataType dtype,
     const std::vector<bst_float>* vec = nullptr;
     if (!std::strcmp(key, "label")) {
       vec = &this->labels_.HostVector();
+    } else if (!std::strcmp(key, "alternate_label")) {
+      vec = &this->alternate_labels_;
+    } else if (!std::strcmp(key, "alternate_label_weights")) {
+      vec = &this->alternate_label_weights_;
     } else if (!std::strcmp(key, "weight")) {
       vec = &this->weights_.HostVector();
     } else if (!std::strcmp(key, "base_margin")) {
@@ -491,6 +602,19 @@ void MetaInfo::Extend(MetaInfo const& that, bool accumulate_rows) {
   this->labels_.SetDevice(that.labels_.DeviceIdx());
   this->labels_.Extend(that.labels_);
 
+  CHECK_EQ(this->num_alternate_labels_, that.num_alternate_labels_)
+      << "Number of alternate labels must be consistent across batches.";
+  this->num_alternate_labels_ = that.num_alternate_labels_;
+  this->alternate_labels_.insert(this->alternate_labels_.end(),
+                                 that.alternate_labels_.cbegin(),
+                                 that.alternate_labels_.cend());
+  if (!that.alternate_label_weights_.empty()) {
+    this->alternate_label_weights_.resize(that.alternate_label_weights_.size());
+    std::copy(that.alternate_label_weights_.cbegin(),
+              that.alternate_label_weights_.cend(),
+              this->alternate_label_weights_.begin());
+  }
+
   this->weights_.SetDevice(that.weights_.DeviceIdx());
   this->weights_.Extend(that.weights_);
 
@@ -562,6 +686,21 @@ void MetaInfo::Validate(int32_t device) const {
         << "Size of labels must equal to number of rows.";
     check_device(labels_);
     return;
+  }
+  if (alternate_labels_.size() != 0) {
+    CHECK_GT(num_alternate_labels_, 0)
+        << "Number of alternate label columns must be greater than zero "
+           "when alternate label values are present.";
+    CHECK_EQ(alternate_labels_.size() % num_alternate_labels_, 0)
+        << "Size of alternate labels array must be a multiple of "
+           "the number of alternate label columns.";
+    CHECK_EQ(alternate_labels_.size() / num_alternate_labels_, num_row_)
+        << "Size of alternate labels array must equal the product of "
+           "the number of alternate label columns and the number of rows.";
+    CHECK(alternate_label_weights_.size() == 0 ||
+          alternate_label_weights_.size() == num_alternate_labels_)
+        << "Number of alternate label weights must equal "
+           "the number of alternate label columns.";
   }
   if (labels_lower_bound_.Size() != 0) {
     CHECK_EQ(labels_lower_bound_.Size(), num_row_)

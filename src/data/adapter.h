@@ -105,6 +105,7 @@ class SingleBatchDataIter : dmlc::DataIter<DType> {
  * weights or qid. */
 class NoMetaInfo {
  public:
+  size_t LabelCount() const { return 0; }
   const float* Labels() const { return nullptr; }
   const float* Weights() const { return nullptr; }
   const uint64_t* Qid() const { return nullptr; }
@@ -453,6 +454,7 @@ class FileAdapterBatch {
     return Line{idx + row_offset_, &block_->index[begin], &block_->value[begin],
                 end - begin};
   }
+  size_t LabelCount() const { return block_->label_count; }
   const float* Labels() const { return block_->label; }
   const float* Weights() const { return block_->weight; }
   const uint64_t* Qid() const { return block_->qid; }

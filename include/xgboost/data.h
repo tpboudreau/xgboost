@@ -45,7 +45,7 @@ enum class FeatureType : uint8_t {
 class MetaInfo {
  public:
   /*! \brief number of data fields in MetaInfo */
-  static constexpr uint64_t kNumField = 11;
+  static constexpr uint64_t kNumField = 13;
 
   /*! \brief number of rows in the data */
   uint64_t num_row_{0};  // NOLINT
@@ -55,6 +55,13 @@ class MetaInfo {
   uint64_t num_nonzero_{0};  // NOLINT
   /*! \brief label of each instance */
   HostDeviceVector<bst_float> labels_;  // NOLINT
+
+  uint64_t num_alternate_labels_{0};  // NOLINT
+
+  std::vector<bst_float> alternate_labels_;  // NOLINT
+
+  std::vector<bst_float> alternate_label_weights_;  // NOLINT
+
   /*!
    * \brief the index of begin and end of a group
    *  needed when the learning task is ranking.
@@ -105,6 +112,8 @@ class MetaInfo {
    * \brief Validate all metainfo.
    */
   void Validate(int32_t device) const;
+
+  void ResetLabels();
 
   MetaInfo Slice(common::Span<int32_t const> ridxs) const;
   /*!
