@@ -687,10 +687,11 @@ void MetaInfo::Validate(int32_t device) const {
     check_device(labels_);
     return;
   }
-  if (alternate_labels_.size() != 0) {
-    CHECK_GT(num_alternate_labels_, 0)
-        << "Number of alternate label columns must be greater than zero "
-           "when alternate label values are present.";
+  if (num_alternate_labels_ > 0) {
+    CHECK_GT(alternate_labels_.size(), 0)
+        << "Size of alternate labels array must be greater than zero "
+           "when the number of alternate label columns is greanter "
+           "than zero.";
     CHECK_EQ(alternate_labels_.size() % num_alternate_labels_, 0)
         << "Size of alternate labels array must be a multiple of "
            "the number of alternate label columns.";

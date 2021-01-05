@@ -281,6 +281,31 @@ def _convert_unknown_data(data, meta=None, meta_type=None):
     return data
 
 
+def prepare_alternate_label(alternate_label, alternate_label_weights=None):
+    alternate_label_ = None
+    alternate_label_weights_ = None
+    if alternate_label is not None:
+        # TODO(tpb) confirm 2D array of numeric arrays (?)
+        column_lengths = [len(column) for column in alternate_label]
+        if all([l == column_lengths[0] for l in column_lengths]):
+            alternate_label_ = [label for row in zip(*alternate_label) for label in row]
+            if len(alternate_label_) > 0:
+                alternate_label_weights_ = [1 for column in alternate_label]
+            else:
+                alternate_label_weights_ = []
+        else:
+            msg = 'all alternate_label columns must have the same length'
+            raise ValueError(msg)
+    if alternate_label_weights is not None:
+        # TODO(tpb) confirm 1D numeric array (?)
+        if alternate_label_weights_ is not None:
+            if len(alternate_label_weights) != len(alternate_label_weights_):
+                msg = 'length of alternate_label_weights must equal the number of alternate_label columns'
+                raise ValueError(msg)
+        alternate_label_weights_ = alternate_label_weights
+    return alternate_label_, alternate_label_weights_
+
+
 class DataIter:
     '''The interface for user defined data iterator. Currently is only
     supported by Device DMatrix.
@@ -319,6 +344,7 @@ class DataIter:
         if self.exception is not None:
             return 0
 
+        # TODO(tpb) sort out alt labs in the quantile dmatrix
         def data_handle(data, label=None, weight=None, base_margin=None,
                         group=None,
                         label_lower_bound=None, label_upper_bound=None,
@@ -490,7 +516,7 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
             rest (one hot) categorical split.  Also, JSON serialization format,
             `gpu_predictor` and pandas input are required.
 
-        alternate_label : list of lists, numpy array or cudf.DataFrame, optional
+        alternate_label : array of lists, numpy array or cudf.DataFrame, optional
             Alternate labels of the training data.
         alternate_label_weights : list, numpy 1-D array or cudf.DataFrame , optional
             Weight for each alternate label.
@@ -517,10 +543,11 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         assert handle is not None
         self.handle = handle
 
-        # TODO(tpb) set_info() one of (a) label or
-        # (b) alternate_label/alternate_label_weights, not both
+        alternate_label_, alternate_label_weights_ = prepare_alternate_label(alternate_label, alternate_label_weights)
+
         self.set_info(label=label, weight=weight, base_margin=base_margin,
-                      alternate_label_weights=alternate_label_weights)
+                      alternate_label=alternate_label_,
+                      alternate_label_weights=alternate_label_weights_)
 
         if feature_names is not None:
             self.feature_names = feature_names
@@ -565,10 +592,9 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
             dispatch_meta_backend(matrix=self, data=feature_weights,
                                   name='feature_weights')
         if alternate_label is not None:
-            self.set_alternate_label(alternate_label)
+            self.set_alternate_label_(alternate_label)
         if alternate_label_weights is not None:
-            self.set_float_info('alternate_label_weights',
-                                alternate_label_weights)
+            self.set_alternate_label_weights(alternate_label_weights)
 
     def get_float_info(self, field):
         """Get float property from the DMatrix.
@@ -729,26 +755,42 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         from .data import dispatch_meta_backend
         dispatch_meta_backend(self, group, 'group', 'uint32')
 
-    def set_alternate_label(self, alternate_label):
-        """Set alternate labels of the Dmatrix
+    def set_alternate_label(self, alternate_label, alternate_label_weights=None):
+        """Set alternate labels and weights of the Dmatrix
 
         Parameters
         ----------
         alternate_label: array of array like
             The set of alternate labels for the DMatrix
+        alternate_label_weights: array like , optional
+            The weight for each alternate label in the DMatrix
         """
-        #from .data import dispatch_meta_backend
-        #dispatch_meta_backend(self, label, 'alternate_label', 'float')
-        raise NotImplementedError()
+        alternate_label_, alternate_label_weights_ = prepare_alternate_label(alternate_label, alternate_label_weights)
+        if alternate_label_ is not None:
+            self.set_alternate_label_(alternate_label_)
+        if alternate_label_weights_ is not None:
+            self.set_alternate_label_weights(alternate_label_weights_)
 
-    def set_alternate_label_weights(self, alternate_label_weights):
+    def set_alternate_label_(self, alternate_label_):
+        from .data import dispatch_meta_backend
+        dispatch_meta_backend(self, alternate_label_,
+                              'alternate_label', 'float')
+
+    def set_alternate_label_weights(self, alternate_label_weights, force_update=False):
         """Set weights for alternate labels in the DMatrix
 
         Parameters
         ----------
         alternate_label_weights: array like
             The weight for each alternate label in the DMatrix
+        force_update : bool
+            Whether to update the weights even if number of weights provided does not match number alternate labels in the DMatrix
         """
+        if not force_update:
+            if alternate_label_weights is None or len(alternate_label_weights) == 0 or len(alternate_label_weights) == self.num_alternate_labels():
+                pass
+            else:
+                raise ValueError('number of alternate label weights must equal the number of alternate labels in the DMatrix')
         from .data import dispatch_meta_backend
         dispatch_meta_backend(self, alternate_label_weights,
                               'alternate_label_weights', 'float')
@@ -771,6 +813,19 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         """
         return self.get_float_info('weight')
 
+    def num_alternate_labels(self):
+        # TODO(tpb) -- this method should contain a simple call to a scalar valued C API function (like self.num_col) as soon as that API can be updated
+        alternate_label_ = self.get_float_info('alternate_label')
+        num_row = self.num_row()
+        if num_row == 0:
+            if len(alternate_label_) > 0:
+                raise ValueError()
+            else:
+                return 0
+        if len(alternate_label_) % num_row != 0:
+            raise ValueError()
+        return len(alternate_label_) // num_row
+
     def get_alternate_label(self):
         """Get the alternate labels of the DMatrix.
 
@@ -778,8 +833,24 @@ class DMatrix:                  # pylint: disable=too-many-instance-attributes
         -------
         alternate_label : list of array
         """
-        #a = self.get_float_info('alternate_label')
-        raise NotImplementedError()
+        alternate_label_ = self.get_float_info('alternate_label')
+        num_row = self.num_row()
+        message = 'length of alternate label array in the DMatrix is inconsistent with the number of rows'
+        if num_row == 0:
+            if len(alternate_label_) > 0:
+                raise ValueError(message)
+            else:
+                return []
+
+        if len(alternate_label_) % num_row != 0:
+            raise ValueError(message)
+
+        num_alternate_labels = len(alternate_label_) // num_row
+        alternate_label = [[] for _ in range(num_alternate_labels)]
+        for p in zip([c % num_alternate_labels for c in range(len(alternate_label_))], alternate_label_):
+            alternate_label[p[0]].append(p[1])
+        return alternate_label
+
 
     def get_alternate_label_weights(self):
         """Get the weights for each alternate label of the DMatrix.
@@ -1019,6 +1090,7 @@ class DeviceQuantileDMatrix(DMatrix):
             self.handle = data
             return
         from .data import init_device_quantile_dmatrix
+        # TODO(tpb) sort out alt labs in the quantile dmatrix
         handle, feature_names, feature_types = init_device_quantile_dmatrix(
             data, missing=self.missing, threads=self.nthread,
             max_bin=self.max_bin,

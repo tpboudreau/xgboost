@@ -996,7 +996,7 @@ class LearnerImpl : public LearnerIO {
 
     //LOG(CONSOLE) << "TPB UpdateOneIter()";
     auto& info = train->Info();
-    if (!info.alternate_labels_.empty()) {
+    if (info.num_alternate_labels_ > 0) {
       info.ResetLabels();
     }
     this->CheckDataSplitMode();
@@ -1065,7 +1065,11 @@ class LearnerImpl : public LearnerIO {
     for (size_t i = 0; i < data_sets.size(); ++i) {
       std::shared_ptr<DMatrix> m = data_sets[i];
       //LOG(CONSOLE) << "TPB EvalOneIter()";
-      // TODO(tpb) -- decide whether alternating labels (m->Info().ResetLabels()) are appropriate here
+      // TODO(tpb) -- confirm that alternating labels are appropriate here
+      auto& info = m->Info();
+      if (info.num_alternate_labels_ > 0) {
+        info.ResetLabels();
+      }
       auto &predt = local_cache->Cache(m, generic_parameters_.gpu_id);
       this->ValidateDMatrix(m.get(), false);
       this->PredictRaw(m.get(), &predt, false);
